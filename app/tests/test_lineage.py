@@ -21,6 +21,7 @@ def base_sources():
     return [
         {"table": "t_a", "columns": ["id", "flag", "val", "grp"]},
         {"table": "t_b", "columns": ["id", "name", "amt"]},
+        {"table": "t_c", "columns": ["id", "x"]},
     ]
 
 
@@ -289,12 +290,20 @@ sample_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 with open(sample_path, encoding="utf-8") as fh:
     sample = json.load(fh)
 r = analyze(sample, "ods_card_transaction", "transfer_flag")
-check("样例-3个模型全部受影响", r["model_count"] == 3)
-check("样例-19个输出列受影响", r["column_count"] == 19)
+check("样例-4个模型受影响", r["model_count"] == 4, str(r["model_count"]))
+check("样例-21个输出列受影响", r["column_count"] == 21, str(r["column_count"]))
 # 每个路径都能回溯到源表种子
 ok = all(c["path"][0]["type"] == "source"
          for m in r["affected_models"] for c in m["columns"])
 check("样例-所有路径回到源表", ok)
+# 卡状态：只出现在 EXISTS 返回列的模型不受影响，参与嵌套筛选的模型受影响
+r = analyze(sample, "ods_card_info", "status")
+names = {m["model"] for m in r["affected_models"]}
+check("样例-卡状态5模型受影响", r["model_count"] == 5 and r["column_count"] == 23,
+      f"{r['model_count']}/{r['column_count']}")
+check("样例-EXISTS返回列模型不误报", "ads_status_probe_settlement" not in names)
+check("样例-嵌套筛选模型命中",
+      {"ads_active_card_settlement", "ads_city_in_settlement"} <= names, str(names))
 
 # 23. 关联子查询 → 报错 ----------------------------------------------------------------
 p = make_payload([{"name": "m_bad", "sql":
@@ -361,6 +370,112 @@ check("diamond-汇合模型全列污染",
 check("diamond-路径均回源",
       all(c["path"][0]["type"] == "source" and c["path"][0]["column"] == "flag"
           for c in m5["columns"]))
+
+# 28. EXISTS 只看子查询有没有记录：返回列中的字段不影响外层 -----------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, a.val AS val FROM t_a a "
+     "WHERE EXISTS (SELECT b.amt AS amt FROM t_b b WHERE b.name = 'x')"},
+])
+r = analyze(p, "t_b", "amt")  # amt 只出现在 EXISTS 返回列
+check("EXISTS返回列-零影响", r["model_count"] == 0, str(r["model_count"]))
+r = analyze(p, "t_b", "name")  # name 在 EXISTS 内层 WHERE -> 存在性受影响
+m = r["affected_models"][0]
+check("EXISTS内层筛选-条件污染全输出",
+      {c["column"] for c in m["columns"]} == {"id", "val"})
+check("EXISTS内层筛选-条件查询标注",
+      m["condition_queries"] == ["EXISTS 子查询#1", "m1"], str(m["condition_queries"]))
+path = next(c for c in m["columns"] if c["column"] == "id")["path"]
+exists_step = next(s for s in path if s.get("predicate") == "EXISTS")
+check("EXISTS步骤-注明存在性检查",
+      exists_step.get("existence") is True and exists_step.get("input_column") is None
+      and exists_step.get("input_relation") == "EXISTS 子查询#1",
+      str(exists_step))
+check("EXISTS步骤-不写成取列",
+      all(not (s.get("predicate") == "EXISTS" and s.get("input_column"))
+          for c in m["columns"] for s in c["path"]))
+# 子查询内部条件步骤指向筛选条件本身，而非某个返回列
+inner = next(s for s in path if s["type"] == "node" and s["query"] == "EXISTS 子查询#1")
+check("EXISTS内部步骤-指向筛选条件", inner.get("output") is None, str(inner))
+
+# 29. 单列 IN 还看返回列的值 ----------------------------------------------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, a.val AS val FROM t_a a "
+     "WHERE a.grp IN (SELECT b.name AS name FROM t_b b)"},
+])
+r = analyze(p, "t_b", "name")  # name 是 IN 子查询返回列 -> 外层条件受影响
+m = r["affected_models"][0]
+check("IN返回列-条件污染全输出",
+      {c["column"] for c in m["columns"]} == {"id", "val"})
+path = next(c for c in m["columns"] if c["column"] == "id")["path"]
+in_step = next(s for s in path if s.get("predicate") == "IN")
+check("IN步骤-标明返回列",
+      in_step.get("input_column") == "name" and in_step.get("via") == "condition",
+      str(in_step))
+check("IN步骤-返回列经值传递进入子查询",
+      any(s.get("via") == "value" and s.get("query") == "IN 子查询#1" for s in path))
+
+# 30. EXISTS 内嵌 IN：谓词逐层归属，路径不跨层直连 ------------------------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id FROM t_a a "
+     "WHERE EXISTS (SELECT b.id AS id FROM t_b b "
+     "              WHERE b.id IN (SELECT c.id AS id FROM t_c c WHERE c.x = 1))"},
+])
+_, infos, _ = build_models(p)
+root = infos["m1"].by_name["m1"]
+check("嵌套谓词-主查询只登记EXISTS",
+      len(root.predicate_subqueries) == 1, str(root.predicate_subqueries))
+exists_node = infos["m1"].by_name["EXISTS 子查询#2"]
+check("嵌套谓词-IN挂在EXISTS下",
+      len(exists_node.predicate_subqueries) == 1
+      and exists_node.pred_kind == "exists")
+r = analyze(p, "t_c", "x")
+m = r["affected_models"][0]
+check("嵌套谓词-条件污染全输出", {c["column"] for c in m["columns"]} == {"id"})
+check("嵌套谓词-条件查询逐层标注",
+      m["condition_queries"] == ["EXISTS 子查询#2", "IN 子查询#1", "m1"],
+      str(m["condition_queries"]))
+chain = [s.get("query") for s in m["columns"][0]["path"] if s["type"] == "node"]
+check("嵌套谓词-路径逐层经过IN/EXISTS",
+      chain == ["IN 子查询#1", "EXISTS 子查询#2", "m1"], str(chain))
+steps = m["columns"][0]["path"]
+check("嵌套谓词-EXISTS步为存在性检查",
+      steps[-1].get("predicate") == "EXISTS" and steps[-1].get("existence") is True
+      and steps[-1].get("input_column") is None)
+check("嵌套谓词-IN步深入EXISTS内部",
+      steps[-2].get("predicate") == "IN" and steps[-2].get("query") == "EXISTS 子查询#2"
+      and steps[-2].get("input_column") == "id")
+
+# 31. 多列 IN 子查询 / 元组左操作数 -> 报错 ------------------------------------------------
+for bad_sql, kw in [
+    ("SELECT a.id AS id FROM t_a a WHERE a.id IN (SELECT b.id AS id, b.amt AS amt FROM t_b b)",
+     "单列 IN"),
+    ("SELECT a.id AS id FROM t_a a WHERE (a.id, a.flag) IN (SELECT b.id AS id, b.amt AS amt FROM t_b b)",
+     "单列 IN"),
+]:
+    p = make_payload([{"name": "m_bad", "sql": bad_sql}])
+    try:
+        build_models(p)
+        check(f"多列IN-报错-{kw}", False)
+    except AnalysisError as e:
+        check(f"多列IN-报错-{kw}", "单列 IN" in str(e) and "m_bad" in str(e), str(e))
+
+# 32. IN 子查询内嵌 FROM 派生表：派生表按别名正常归类 --------------------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id FROM t_a a "
+     "WHERE a.id IN (SELECT d.id AS id FROM (SELECT b.id AS id FROM t_b b WHERE b.amt = 1) d)"},
+])
+_, infos, _ = build_models(p)
+check("IN内派生表-保留别名", "d" in infos["m1"].by_name, str(list(infos["m1"].by_name)))
+r = analyze(p, "t_b", "amt")
+m = r["affected_models"][0]
+check("IN内派生表-条件污染全输出", {c["column"] for c in m["columns"]} == {"id"})
+chain = [s.get("query") for s in m["columns"][0]["path"] if s["type"] == "node"]
+check("IN内派生表-路径经过派生表与IN",
+      chain == ["d", "IN 子查询#1", "m1"], str(chain))
 
 print()
 if FAILURES:

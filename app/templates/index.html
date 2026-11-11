@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>公交清分数仓 · 换乘标志口径调整影响分析</title>
+<title>公交清分数仓 · 字段口径调整影响分析</title>
 <style>
   :root {
     --bg: #f4f6fa;
@@ -248,6 +248,7 @@
     color: #344054;
   }
   .node-ref.source { background: #ecfdf3; color: #05603a; }
+  .node-ref.exists { background: #fffaeb; color: #b54708; }
   .via {
     font-size: 10.5px;
     padding: 1px 7px;
@@ -305,8 +306,8 @@
 </head>
 <body>
 <header>
-  <h1>公交清分数仓 · 换乘标志口径调整影响分析</h1>
-  <p>基于 SQLGlot 解析 DuckDB SQL，定位待改源表字段影响的模型输出列与依赖路径</p>
+  <h1>公交清分数仓 · 字段口径调整影响分析</h1>
+  <p>基于 SQLGlot 解析 DuckDB SQL，定位待改源表字段（换乘标志、卡状态等）影响的模型输出列与依赖路径</p>
 </header>
 
 <div class="layout">
@@ -534,11 +535,17 @@ function renderPath(path) {
     }
     const arrow = i > 0 ? '<span class="arrow">→</span>' : "";
     const via = step.via ? `<span class="via ${step.via}">${step.via === "value" ? "值传递" : "条件"}</span>` : "";
+    // EXISTS 步骤：注明检查哪个子查询是否有记录，不写成取列
+    const input = step.predicate === "EXISTS"
+      ? `<span class="node-ref exists">EXISTS 检查 ${escapeHtml(step.input_relation)} 是否有记录</span>`
+      : `<span class="node-ref">${escapeHtml(step.input_relation)}.${escapeHtml(step.input_column)}</span>`;
+    // output 为空表示该步命中的是查询的筛选条件本身（如 EXISTS 子查询内部）
+    const output = step.output == null ? "〈筛选条件〉" : escapeHtml(step.output);
     const pred = step.predicate ? `<span class="via condition">${escapeHtml(step.predicate)}</span>` : "";
     return `<div class="path-step">${arrow}
       <span class="node-ref">${escapeHtml(step.model)} · ${escapeHtml(step.query)}</span>
-      <span class="node-ref">${escapeHtml(step.input_relation)}.${escapeHtml(step.input_column)}</span>
-      <span class="arrow">→</span><span class="node-ref">${escapeHtml(step.output)}</span>
+      ${input}
+      <span class="arrow">→</span><span class="node-ref">${output}</span>
       ${via}${pred}</div>`;
   }).join("") + `</div>`;
 }
@@ -558,7 +565,9 @@ function renderResult(r) {
     <div class="alert alert-info">
       <span>🎯</span>
       <span>起点字段：<b>${escapeHtml(r.target.table)}.${escapeHtml(r.target.column)}</b>。
-      字段进入 JOIN ON / WHERE（含 IN 子查询）时，该查询及其下游实际读取者的<b>全部输出列</b>按条件污染标出。</span>
+      字段进入 JOIN ON / WHERE、IN 子查询的返回列或筛选条件，或影响 EXISTS 子查询是否有记录时，
+      该查询及其下游实际读取者的<b>全部输出列</b>按条件污染标出；
+      仅出现在 EXISTS 子查询返回列中的字段不影响外层查询。</span>
     </div>`;
 
   const cards = r.affected_models.map(m => `

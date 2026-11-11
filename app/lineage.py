@@ -6,6 +6,12 @@ INNER JOIN、WHERE，无星号，列引用均带表名/别名）。
 输出：被选字段影响到的模型输出列，以及每列的一条依赖路径。
 字段一旦进入 JOIN/筛选条件，即视为污染整个查询的全部输出列，
 并向真正读取该查询结果的下游查询传播。
+
+谓词子查询按语义区分：
+- EXISTS 只看子查询有没有记录——其子查询的筛选条件（含嵌套谓词）受影响，
+  外层查询的条件才算受影响；仅出现在 EXISTS 返回列中的字段不影响外层。
+- 单列 IN 还看返回列的值——子查询返回列或其筛选条件受影响，
+  外层查询的条件都算受影响。
 """
 from __future__ import annotations
 
@@ -55,7 +61,7 @@ class Leaf:
 
 @dataclass
 class QueryNode:
-    """一个 SELECT 作用域（根查询 / CTE / FROM 子查询 / WHERE 子查询）。"""
+    """一个 SELECT 作用域（根查询 / CTE / FROM 子查询 / WHERE 谓词子查询）。"""
     node_id: str
     kind: str  # root | cte | subquery
     name: str  # cte 名 / 子查询别名 / 根为模型名
@@ -66,8 +72,10 @@ class QueryNode:
     sources: dict[str, tuple[str, str]]
     # JOIN ON / WHERE 中引用到的叶子
     predicate_leaves: set[Leaf]
-    # 谓词中的 IN (SELECT ...) 子查询节点 id（其污染输出触发本节点条件污染）
+    # 谓词中的 IN/EXISTS 子查询节点 id（仅本作用域直接嵌套的一层）
     predicate_subqueries: list[str] = field(default_factory=list)
+    # 谓词子查询种类："in" | "exists"；非谓词子查询节点为空串
+    pred_kind: str = ""
     # 对应的 sqlglot 作用域表达式，用于子查询匹配
     scope_expr: object = None
     # 运行期：被污染的叶子集合
@@ -130,6 +138,22 @@ def _validate_structure(tree: exp.Expression, model_name: str) -> None:
                 raise AnalysisError(
                     f"模型「{model_name}」仅允许普通 INNER JOIN，发现特殊 JOIN 修饰。"
                 )
+        # IN 子查询：只支持单列形式（左操作数单列、子查询返回单列）
+        if isinstance(node, exp.In):
+            query = node.args.get("query")
+            if isinstance(query, exp.Subquery):
+                if isinstance(node.this, exp.Tuple):
+                    raise AnalysisError(
+                        f"模型「{model_name}」在 IN 左侧使用了多列元组（{node.this.sql()}），"
+                        "本工具仅支持单列 IN 子查询。"
+                    )
+                inner = query.this
+                ncols = len(inner.selects) if isinstance(inner, exp.Select) else 0
+                if ncols != 1:
+                    raise AnalysisError(
+                        f"模型「{model_name}」的 IN 子查询返回 {ncols} 列，"
+                        "本工具仅支持单列 IN 子查询。"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,18 +235,37 @@ def _collect_leaves(expression: exp.Expression | None, scope, node: QueryNode,
 
 
 def _predicate_subquery_exprs(expression: exp.Expression) -> list[exp.Expression]:
-    """提取谓词表达式中 IN/EXISTS 子查询的内层 SELECT 表达式。"""
+    """提取谓词表达式中属于本作用域的 IN/EXISTS 子查询的内层 SELECT。
+
+    嵌套在谓词子查询内部的 IN/EXISTS 由内层作用域自行登记，
+    这里遇到嵌套的子查询/SELECT 即剪枝，避免把内层谓词直接挂到外层查询
+    （例如 EXISTS 内嵌 IN 时，内层 IN 只属于 EXISTS 子查询）。
+    """
     result: list[exp.Expression] = []
-    for in_node in expression.find_all(exp.In):
-        query = in_node.args.get("query")
-        if isinstance(query, exp.Subquery):
-            result.append(query.this)
-    for exists_node in expression.find_all(exp.Exists):
-        inner = exists_node.this
-        if isinstance(inner, exp.Subquery):
-            inner = inner.this
-        if isinstance(inner, exp.Select):
-            result.append(inner)
+    stack = [expression]
+    while stack:
+        child = stack.pop()
+        if isinstance(child, list):
+            stack.extend(child)
+            continue
+        if not isinstance(child, exp.Expression):
+            continue
+        # 剪枝：嵌套子查询内部由其自身作用域处理
+        if child is not expression and isinstance(child, (exp.Subquery, exp.Select)):
+            continue
+        if isinstance(child, exp.In):
+            query = child.args.get("query")
+            if isinstance(query, exp.Subquery):
+                result.append(query.this)
+            elif isinstance(query, exp.Select):
+                result.append(query)
+        elif isinstance(child, exp.Exists):
+            inner = child.this
+            if isinstance(inner, exp.Subquery):
+                inner = inner.this
+            if isinstance(inner, exp.Select):
+                result.append(inner)
+        stack.extend(child.args.values())
     return result
 
 
@@ -237,12 +280,14 @@ def _build_model(model_name: str, sql: str,
     nodes: list[QueryNode] = []
     by_name: dict[str, QueryNode] = {}
     sub_seq = 0
+    pred_seq = 0
     # 延迟登记的谓词子查询：(所属节点, 内层 SELECT 表达式)
     pending_predicate_subs: list[tuple[QueryNode, exp.Expression]] = []
 
     for scope in traverse_scope(tree):
         expr = scope.expression
         parent = expr.parent
+        pred_kind = ""
         if scope.is_root or parent is None:
             kind, qname = "root", model_name
             node_id = f"{model_name}#root"
@@ -250,36 +295,27 @@ def _build_model(model_name: str, sql: str,
             kind, qname = "cte", parent.alias
             node_id = f"{model_name}#cte:{qname}"
         else:
-            # FROM 中的派生表必须有别名；WHERE 中的谓词子查询（IN/EXISTS）不是关系，
-            # 不能被外层按名引用，使用自动生成的内部名称。
-            # IN 的作用域父节点是 Subquery，EXISTS 的父节点直接是 Exists。
-            is_in_sub = isinstance(parent, exp.Subquery) and parent.find_ancestor(exp.In) is not None
-            is_exists = isinstance(parent, exp.Exists)
-            in_predicate = is_in_sub or is_exists
-            # SELECT 投影中的标量子查询（Subquery 父级是 Alias 而非 From/In）
-            is_scalar = (
-                isinstance(parent, exp.Subquery)
-                and not isinstance(parent.parent, exp.From)
-                and parent.find_ancestor(exp.In) is None
+            # 按父节点精确区分作用域类型：
+            # IN 谓词子查询的内层是 Subquery 且其父节点为 In；
+            # EXISTS 谓词子查询的内层父节点直接是 Exists（或包一层 Subquery）；
+            # FROM 派生表的父 Subquery 挂在 From 下。
+            # 不能向上找 In 祖先——FROM 派生表也可能恰好嵌在 IN 子查询内部。
+            is_in_sub = isinstance(parent, exp.Subquery) and isinstance(parent.parent, exp.In)
+            is_exists = isinstance(parent, exp.Exists) or (
+                isinstance(parent, exp.Subquery) and isinstance(parent.parent, exp.Exists)
             )
-            if is_scalar:
-                raise AnalysisError(
-                    f"模型「{model_name}」在 SELECT 投影中使用了标量子查询"
-                    f"（{parent.sql()[:60]}），本工具不支持该写法，请改写为 INNER JOIN。"
-                )
-            if in_predicate:
+            is_from_derived = isinstance(parent, exp.Subquery) and isinstance(parent.parent, exp.From)
+            if is_in_sub or is_exists:
+                # WHERE 中的谓词子查询（IN/EXISTS）不是关系，不能被外层按名引用，
+                # 使用自动生成的内部名称。
                 kind = "subquery"
-                sub_seq += 1
-                pred = "EXISTS" if is_exists else "IN"
-                qname = f"{pred} 子查询#{sub_seq}"
-                node_id = f"{model_name}#predsub:{sub_seq}"
-            else:
+                pred_seq += 1
+                pred_kind = "in" if is_in_sub else "exists"
+                pred = "IN" if is_in_sub else "EXISTS"
+                qname = f"{pred} 子查询#{pred_seq}"
+                node_id = f"{model_name}#predsub:{pred_seq}"
+            elif is_from_derived:
                 kind = "subquery"
-                if not isinstance(parent, exp.Subquery):
-                    raise AnalysisError(
-                        f"模型「{model_name}」存在无法归类的子查询（父节点 {type(parent).__name__}），"
-                        "本工具仅支持 FROM 派生表与 IN/EXISTS 谓词子查询。"
-                    )
                 sub_alias = parent.alias
                 if not sub_alias:
                     raise AnalysisError(
@@ -288,6 +324,18 @@ def _build_model(model_name: str, sql: str,
                 qname = sub_alias
                 sub_seq += 1
                 node_id = f"{model_name}#sub:{qname}"
+            elif isinstance(parent, exp.Subquery):
+                # SELECT 投影 / WHERE 中的标量子查询等其余 Subquery 形态
+                raise AnalysisError(
+                    f"模型「{model_name}」使用了标量子查询（{parent.sql()[:60]}），"
+                    "本工具仅支持 FROM 派生表与 WHERE 中的 IN/EXISTS 非关联子查询，"
+                    "标量子查询请改写为 INNER JOIN。"
+                )
+            else:
+                raise AnalysisError(
+                    f"模型「{model_name}」存在无法归类的子查询（父节点 {type(parent).__name__}），"
+                    "本工具仅支持 FROM 派生表与 IN/EXISTS 谓词子查询。"
+                )
 
         if qname in by_name:
             raise AnalysisError(f"模型「{model_name}」中 CTE/子查询名「{qname}」重复。")
@@ -326,6 +374,7 @@ def _build_model(model_name: str, sql: str,
             output_leaves=output_leaves,
             sources=sources,
             predicate_leaves=set(),
+            pred_kind=pred_kind,
             scope_expr=expr,
         )
 
@@ -520,6 +569,27 @@ def _topological_order(infos: dict[str, ModelInfo]) -> list[str]:
 # 污染传播
 # ---------------------------------------------------------------------------
 
+def _predicate_sub_hit(node: QueryNode, by_id: dict[str, QueryNode]) -> bool:
+    """谓词子查询是否导致本查询的筛选条件受影响。
+
+    EXISTS 只看子查询有没有记录：其子查询的筛选条件（含嵌套谓词）受影响才命中，
+    仅返回列被污染不命中；IN 还看返回列的值：子查询任一输出列被污染即命中。
+    """
+    for sid in node.predicate_subqueries:
+        sub = by_id[sid]
+        if sub.pred_kind == "exists":
+            if _condition_hit(sub, by_id):
+                return True
+        elif sub.tainted_outputs:
+            return True
+    return False
+
+
+def _condition_hit(node: QueryNode, by_id: dict[str, QueryNode]) -> bool:
+    """本查询的筛选条件（JOIN ON / WHERE，含谓词子查询）是否被污染命中。"""
+    return bool(node.predicate_leaves & node.tainted_leaves) or _predicate_sub_hit(node, by_id)
+
+
 def _propagate_within_model(info: ModelInfo,
                             incoming: dict[str, set[str]],
                             upstream_paths: dict[str, dict[str, list[dict]]]) -> dict[str, list[dict]]:
@@ -557,18 +627,15 @@ def _propagate_within_model(info: ModelInfo,
                     for col in up.tainted_outputs:
                         node.tainted_leaves.add(Leaf(relation=sname, column=col))
 
-            # 3) 谓词子查询（IN (SELECT ...)）任一输出被污染 -> 条件命中
-            predicate_sub_hit = any(
-                bool(by_id[sid].tainted_outputs) for sid in node.predicate_subqueries
-            )
-            condition_hit = bool(node.predicate_leaves & node.tainted_leaves) or predicate_sub_hit
+            # 3) 谓词子查询按语义判定：EXISTS 看子查询有没有记录，IN 还看返回列的值
+            condition_hit = _condition_hit(node, by_id)
 
             # 4) 值依赖传播
             for out_col, leaves in node.output_leaves.items():
                 if leaves & node.tainted_leaves:
                     node.tainted_outputs.add(out_col)
 
-            # 5) 条件污染：JOIN/WHERE/IN 子查询命中 -> 全部输出列
+            # 5) 条件污染：JOIN/WHERE/谓词子查询命中 -> 全部输出列
             if condition_hit:
                 node.tainted_outputs.update(node.output_columns)
 
@@ -581,11 +648,7 @@ def _propagate_within_model(info: ModelInfo,
         raise AnalysisError(f"模型「{info.name}」内部依赖无法收敛，请检查 CTE/子查询引用。")
 
     root = nodes[-1]
-    info.condition_tainted = any(
-        bool(n.predicate_leaves & n.tainted_leaves)
-        or any(by_id[sid].tainted_outputs for sid in n.predicate_subqueries)
-        for n in nodes
-    )
+    info.condition_tainted = any(_condition_hit(n, by_id) for n in nodes)
 
     # 为每个污染输出列记录一条依赖路径
     paths = _build_paths(info, upstream_paths)
@@ -597,79 +660,100 @@ def _build_paths(info: ModelInfo,
     """为根查询每个污染输出列构造一条回溯到源表字段的依赖路径。
 
     upstream_paths: 上游模型名 -> (该模型根输出列 -> 完整路径)。
-    路径由“步骤”组成，每一步描述一个查询节点中 输入列 -> 输出列 的传递，
+    路径由“步骤”组成，每一步描述一个查询节点中 输入 -> 输出 的传递，
     via 标记该步是值依赖(value)还是条件污染(condition)。
+    经过谓词子查询的步骤带 predicate 标记：IN 步骤标明取子查询的哪一返回列；
+    EXISTS 步骤注明检查哪个子查询是否有记录（existence=True，不取列）。
     """
     by_name = info.by_name
     by_id = {n.node_id: n for n in info.nodes}
 
-    def find_path(node: QueryNode, col: str, seen: frozenset) -> list[dict] | None:
-        key = (node.node_id, col)
-        if key in seen:
+    def leaf_prefix(node: QueryNode, leaf: Leaf, seen: frozenset) -> list[dict] | None:
+        """回溯 node 的一个输入叶子，返回到达该叶子之前的路径段。"""
+        stype, actual = node.sources[leaf.relation]
+        if stype in ("cte", "subquery"):
+            up = by_name[actual]
+            if leaf.column in up.tainted_outputs:
+                return find_path(up, leaf.column, seen)
             return None
-        seen = seen | {key}
+        if stype == "model":
+            return upstream_paths.get(actual, {}).get(leaf.column)
+        return [{"type": "source", "relation": actual, "column": leaf.column}]
 
+    def leaf_step(node: QueryNode, col: str | None, via: str, leaf: Leaf) -> dict:
+        _, actual = node.sources[leaf.relation]
+        return {
+            "type": "node",
+            "model": info.name,
+            "query": node.name,
+            "output": col,
+            "via": via,
+            "input_relation": actual,
+            "input_qualifier": leaf.relation,
+            "input_column": leaf.column,
+        }
+
+    def predicate_step(node: QueryNode, col: str | None, sub: QueryNode,
+                       sub_col: str | None) -> dict:
         step = {
             "type": "node",
             "model": info.name,
             "query": node.name,
             "output": col,
+            "via": "condition",
+            "input_relation": sub.name,
+            "input_qualifier": sub.name,
         }
-        cond_leaf_hit = bool(node.predicate_leaves & node.tainted_leaves)
-        value_leaves = [lf for lf in node.output_leaves[col] if lf in node.tainted_leaves]
+        if sub.pred_kind == "exists":
+            # EXISTS 只看子查询有没有记录：注明检查哪个子查询，不写成取列
+            step.update({"predicate": "EXISTS", "existence": True, "input_column": None})
+        else:
+            # IN 还看返回列的值：标明取子查询的哪一列
+            step.update({"predicate": "IN", "input_column": sub_col})
+        return step
 
-        # 优先值依赖，其次条件污染；保证路径反映真实的传递方式
-        ordered: list[tuple[Leaf, str]] = [(lf, "value") for lf in value_leaves]
-        if cond_leaf_hit:
-            for lf in sorted(node.predicate_leaves & node.tainted_leaves,
-                             key=lambda x: (x.relation, x.column)):
-                if not any(lf == v for v, _ in ordered):
-                    ordered.append((lf, "condition"))
+    def find_path(node: QueryNode, col: str | None, seen: frozenset) -> list[dict] | None:
+        """构造到达 node 的某个污染结果、逐层标明实际经过谓词的路径。
 
-        for leaf, via in ordered:
-            stype, actual = node.sources[leaf.relation]
-            cur = dict(step)
-            cur.update({
-                "via": via,
-                "input_relation": actual,
-                "input_qualifier": leaf.relation,
-                "input_column": leaf.column,
-            })
-            if stype in ("cte", "subquery"):
-                up = by_name[actual]
-                if leaf.column in up.tainted_outputs:
-                    sub = find_path(up, leaf.column, seen)
-                    if sub is not None:
-                        return sub + [cur]
-            elif stype == "model":
-                up_paths = upstream_paths.get(actual, {})
-                if leaf.column in up_paths:
-                    return up_paths[leaf.column] + [cur]
-            else:  # 源表：路径起点
-                return [{
-                    "type": "source",
-                    "relation": actual,
-                    "column": leaf.column,
-                }, cur]
+        col 为输出列名；col 为 None 表示目标是该查询的筛选条件本身
+        （EXISTS 子查询的存在性判断只取决于其筛选条件，与其返回列无关）。
+        """
+        key = (node.node_id, col)
+        if key in seen:
+            return None
+        seen = seen | {key}
 
-        # 条件污染经由 IN/EXISTS 谓词子查询：穿过子查询的任一污染输出
+        # 1) 值依赖优先：输出表达式直接引用了被污染的输入列
+        if col is not None:
+            for leaf in sorted(node.output_leaves.get(col, ()) & node.tainted_leaves,
+                               key=lambda x: (x.relation, x.column)):
+                prefix = leaf_prefix(node, leaf, seen)
+                if prefix is not None:
+                    return prefix + [leaf_step(node, col, "value", leaf)]
+
+        # 2) 条件污染：本查询的 JOIN ON / WHERE 直接引用被污染列
+        for leaf in sorted(node.predicate_leaves & node.tainted_leaves,
+                           key=lambda x: (x.relation, x.column)):
+            prefix = leaf_prefix(node, leaf, seen)
+            if prefix is not None:
+                return prefix + [leaf_step(node, col, "condition", leaf)]
+
+        # 3) 条件污染：谓词子查询，按 EXISTS/IN 语义逐层深入
         for sid in node.predicate_subqueries:
-            sub_node = by_id[sid]
-            pred_kind = "EXISTS" if sub_node.name.startswith("EXISTS") else "IN"
-            for sub_col in sub_node.output_columns:
-                if sub_col not in sub_node.tainted_outputs:
-                    continue
-                sub_path = find_path(sub_node, sub_col, seen)
+            sub = by_id[sid]
+            if sub.pred_kind == "exists":
+                # EXISTS：深入子查询的筛选条件（存在性），而非其返回列
+                sub_path = find_path(sub, None, seen)
                 if sub_path is not None:
-                    cur = dict(step)
-                    cur.update({
-                        "via": "condition",
-                        "input_relation": sub_node.name,
-                        "input_qualifier": sub_node.name,
-                        "input_column": sub_col,
-                        "predicate": pred_kind,
-                    })
-                    return sub_path + [cur]
+                    return sub_path + [predicate_step(node, col, sub, None)]
+            else:
+                # IN：深入子查询被污染的返回列
+                for sub_col in sub.output_columns:
+                    if sub_col not in sub.tainted_outputs:
+                        continue
+                    sub_path = find_path(sub, sub_col, seen)
+                    if sub_path is not None:
+                        return sub_path + [predicate_step(node, col, sub, sub_col)]
         return None
 
     root = info.nodes[-1]
@@ -750,12 +834,10 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
                 "via": via,
                 "path": path,
             })
-        # 条件污染判定（根查询或任一内部查询命中条件，含 IN 谓词子查询）
+        # 条件污染判定（根查询或任一内部查询命中条件，含 IN/EXISTS 谓词子查询）
         by_id = {n.node_id: n for n in info.nodes}
         condition_queries = sorted({
-            n.name for n in info.nodes
-            if (n.predicate_leaves & n.tainted_leaves)
-            or any(by_id[sid].tainted_outputs for sid in n.predicate_subqueries)
+            n.name for n in info.nodes if _condition_hit(n, by_id)
         })
         affected.append({
             "model": name,

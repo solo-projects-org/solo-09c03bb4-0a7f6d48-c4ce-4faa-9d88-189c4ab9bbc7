@@ -1,4 +1,4 @@
-"""公交清分数仓 · 换乘标志口径调整影响分析 Web 应用。"""
+"""公交清分数仓 · 字段口径调整影响分析 Web 应用。"""
 from __future__ import annotations
 
 import json

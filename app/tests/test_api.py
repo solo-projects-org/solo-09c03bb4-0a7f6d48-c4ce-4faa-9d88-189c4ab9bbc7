@@ -43,8 +43,33 @@ check("validate 返回模型依赖",
 r = client.post("/api/analyze?table=ods_card_transaction&column=transfer_flag", json=sample)
 body = r.get_json()
 check("analyze 通过", r.status_code == 200 and body["ok"] is True)
-check("analyze 命中 3 模型", body["result"]["model_count"] == 3)
-check("analyze 命中 19 列", body["result"]["column_count"] == 19)
+check("analyze 命中 4 模型", body["result"]["model_count"] == 4)
+check("analyze 命中 21 列", body["result"]["column_count"] == 21)
+
+# 卡状态：只出现在 EXISTS 返回列的模型不误报，参与嵌套筛选的模型正常命中
+r = client.post("/api/analyze?table=ods_card_info&column=status", json=sample)
+body = r.get_json()
+names = {m["model"] for m in body["result"]["affected_models"]}
+check("卡状态 analyze 通过", r.status_code == 200 and body["ok"] is True)
+check("卡状态命中 5 模型 23 列",
+      body["result"]["model_count"] == 5 and body["result"]["column_count"] == 23)
+check("卡状态-EXISTS返回列模型不误报", "ads_status_probe_settlement" not in names)
+check("卡状态-嵌套筛选模型命中",
+      {"ads_active_card_settlement", "ads_city_in_settlement"} <= names)
+# EXISTS 步骤在路径中注明存在性检查、不取列
+probe_paths = [s for m in body["result"]["affected_models"] for c in m["columns"] for s in c["path"]]
+exists_steps = [s for s in probe_paths if s.get("predicate") == "EXISTS"]
+check("卡状态-EXISTS步骤注明存在性",
+      bool(exists_steps) and all(s.get("existence") is True and s.get("input_column") is None
+                                 for s in exists_steps))
+
+# 发卡城市：EXISTS 内层 WHERE / IN 返回列 / EXISTS 内嵌 IN 左操作数均命中
+r = client.post("/api/analyze?table=ods_card_info&column=issue_city", json=sample)
+body = r.get_json()
+names = {m["model"] for m in body["result"]["affected_models"]}
+check("发卡城市命中 3 模型 6 列",
+      body["result"]["model_count"] == 3 and body["result"]["column_count"] == 6)
+check("发卡城市-探针模型经EXISTS条件命中", "ads_status_probe_settlement" in names)
 
 # 缺参数
 r = client.post("/api/analyze", json=sample)
@@ -76,7 +101,7 @@ r = client.post("/api/analyze?table=ods_card_transaction&column=ghost", json=sam
 check("目标列不存在 400", r.status_code == 400 and "ghost" in r.get_json()["error"])
 
 # 未被任何模型读取的字段 -> 零影响
-r = client.post("/api/analyze?table=ods_card_info&column=issue_city", json=sample)
+r = client.post("/api/analyze?table=ods_card_info&column=last_active_date", json=sample)
 body = r.get_json()
 check("未读取字段零影响",
       r.status_code == 200 and body["result"]["model_count"] == 0)
